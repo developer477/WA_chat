@@ -24,17 +24,13 @@ final class Webhook
                 throw new \UnexpectedValueException('Signature/account mismatch');
             }
         }
-        $this->db->link->begin_transaction();
-        try {
-            foreach ($events as $event) {
-                if (!isset($accounts[$event['phone']])) { continue; }
-                $this->db->run("INSERT INTO wa_inbox (event_key,phone_number_id,kind,payload,received_at) VALUES (?,?,?,?,?)
-                    ON DUPLICATE KEY UPDATE event_key=VALUES(event_key)", [$event['key'],$event['phone'],$event['kind'],json_encode($event['payload'], JSON_THROW_ON_ERROR),time()]);
-            }
-            $this->db->link->commit();
-        } catch (\Throwable $e) {
-            $this->db->link->rollback();
-            throw $e;
+        // Each event is an idempotent write. A partial batch returns 503; on Meta's
+        // retry, the unique event key preserves saved events and inserts the rest.
+        // This works without multi-statement transactions, including on MyISAM.
+        foreach ($events as $event) {
+            if (!isset($accounts[$event['phone']])) { continue; }
+            $this->db->run("INSERT INTO wa_inbox (event_key,phone_number_id,kind,payload,received_at) VALUES (?,?,?,?,?)
+                ON DUPLICATE KEY UPDATE event_key=VALUES(event_key)", [$event['key'],$event['phone'],$event['kind'],json_encode($event['payload'], JSON_THROW_ON_ERROR),time()]);
         }
     }
 

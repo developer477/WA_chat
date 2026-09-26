@@ -1,3 +1,4 @@
+-- Uses MyISAM for VICIdial installations with InnoDB disabled.
 -- Bridge state only. No changes to VICIdial tables and no credentials in this migration.
 CREATE TABLE IF NOT EXISTS wa_sessions (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -18,7 +19,7 @@ CREATE TABLE IF NOT EXISTS wa_sessions (
   KEY customer (phone_number_id, sender, state),
   KEY chat (chat_id),
   KEY expiry (state, last_inbound)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS wa_inbox (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -34,7 +35,7 @@ CREATE TABLE IF NOT EXISTS wa_inbox (
   error_code VARCHAR(100) NULL,
   UNIQUE KEY event_key (event_key),
   KEY pending (state, next_attempt, id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS wa_outbox (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -53,7 +54,7 @@ CREATE TABLE IF NOT EXISTS wa_outbox (
   UNIQUE KEY source_part (session_id, source_id, part),
   KEY pending (state, next_attempt, id),
   KEY message (wamid)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;
 
 -- Write-ahead journal for recoverable inserts into legacy MyISAM VICIdial tables.
 CREATE TABLE IF NOT EXISTS wa_vici_operations (
@@ -62,4 +63,4 @@ CREATE TABLE IF NOT EXISTS wa_vici_operations (
   target_id BIGINT UNSIGNED NOT NULL,
   row_json MEDIUMTEXT NOT NULL,
   state VARCHAR(10) NOT NULL DEFAULT 'planned'
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;

@@ -185,8 +185,38 @@ try {
     eq((int)$db->one("SELECT GET_LOCK('wa_test_worker',0) AS n")['n'],1,'first worker lock');
     eq((int)$secondLink->query("SELECT GET_LOCK('wa_test_worker',0) AS n")->fetch_assoc()['n'],0,'second worker excluded');
     $db->run("SELECT RELEASE_LOCK('wa_test_worker')"); $secondLink->close();
+    // Fail the second insert of a webhook batch: the first must survive and retry dedup.
+    $firstKey=hash('sha256','773505685855835:message:partial.1');
+    $secondKey=hash('sha256','773505685855835:message:partial.2');
+    $db->run("CREATE TRIGGER wa_test_fail_batch BEFORE INSERT ON wa_inbox FOR EACH ROW BEGIN IF NEW.event_key='$secondKey' THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected batch failure'; END IF; END");
+    $batch=envelope([message('partial.1','Saved before failure'),message('partial.2','Saved on retry')]);
+    try { receive($webhook,$batch); throw new RuntimeException('fault injection did not fail'); }
+    catch (mysqli_sql_exception $e) { eq($e->getCode(),1644,'injected batch failure'); }
+    eq((int)$db->one('SELECT COUNT(*) AS n FROM wa_inbox WHERE event_key=?',[$firstKey])['n'],1,'partial batch retains saved event');
+    eq((int)$db->one('SELECT COUNT(*) AS n FROM wa_inbox WHERE event_key=?',[$secondKey])['n'],0,'failed event not acknowledged');
+    $db->run('DROP TRIGGER wa_test_fail_batch'); receive($webhook,$batch); receive($webhook,$batch);
+    eq((int)$db->one('SELECT COUNT(*) AS n FROM wa_inbox WHERE event_key IN (?,?)',[$firstKey,$secondKey])['n'],2,'partial batch retry saves each event once');
+
+    // Simulate the session INSERT completing before its inbox mapping was interrupted.
+    $origin=message('origin.recovery','Recover mapping'); $origin['from']='919812340000';
+    receive($webhook,envelope([$origin]));
+    $originEvent=$db->one('SELECT * FROM wa_inbox WHERE event_key=?',[hash('sha256','773505685855835:message:origin.recovery')]);
+    $db->insert('wa_sessions',['did_id'=>12,'phone_number_id'=>'773505685855835','sender'=>$origin['from'],
+        'group_id'=>'TSIM','member'=>'wa'.substr($originEvent['event_key'],0,18),'member_name'=>'Recovery',
+        'last_inbound'=>time(),'created_at'=>time()]);
+    $originSession=(int)$db->link->insert_id;
+    $bridge->tick();
+    eq((int)$db->one('SELECT session_id FROM wa_inbox WHERE id=?',[$originEvent['id']])['session_id'],$originSession,'interrupted mapping recovers original session');
+    eq((int)$db->one('SELECT COUNT(*) AS n FROM wa_sessions WHERE sender=?',[$origin['from']])['n'],1,'no duplicate session after mapping crash');
+    // Even if the session subsequently closed, replay must not create another chat.
+    $saved=$db->one('SELECT * FROM wa_sessions WHERE id=?',[$originSession]);
+    $bridge->close($saved,'window_expired');
+    $db->run("UPDATE wa_inbox SET session_id=NULL,state='pending',next_attempt=0 WHERE id=?",[$originEvent['id']]);
+    $bridge->tick();
+    eq((int)$db->one('SELECT COUNT(*) AS n FROM wa_sessions WHERE sender=?',[$origin['from']])['n'],1,'closed origin session is not recreated');
+    eq($db->one('SELECT state FROM wa_inbox WHERE id=?',[$originEvent['id']])['state'],'closed','closed origin event is terminal');
     $engine=in_array('--innodb',$argv,true)?'InnoDB':'MyISAM';
-    echo "PASS: $count MariaDB integration checks ($engine native tables, InnoDB bridge tables)\n";
+    echo "PASS: $count MariaDB integration checks ($engine native and bridge tables)\n";
 } finally {
     $link->query('UNLOCK TABLES');
     $link->query("DROP DATABASE `$name`");

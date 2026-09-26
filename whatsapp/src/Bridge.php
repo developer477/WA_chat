@@ -90,7 +90,13 @@ final class Bridge
             $this->db->run("UPDATE wa_inbox SET state='failed',error_code='invalid_timestamp' WHERE id=?", [$event['id']]);
             return;
         }
-        $session = $event['session_id'] ? $this->db->one('SELECT * FROM wa_sessions WHERE id=?', [$event['session_id']]) : null;
+        // Stable identity recovers a session insert followed by a crash before inbox mapping.
+        $originMember = 'wa' . substr($event['event_key'], 0, 18);
+        $session = $event['session_id'] ? $this->db->one('SELECT * FROM wa_sessions WHERE id=?', [$event['session_id']])
+            : $this->db->one('SELECT * FROM wa_sessions WHERE member=?', [$originMember]);
+        if ($session && !$event['session_id']) {
+            $this->db->run('UPDATE wa_inbox SET session_id=? WHERE id=?', [$session['id'],$event['id']]);
+        }
         if (!$session) {
             $session = $this->db->one("SELECT * FROM wa_sessions WHERE phone_number_id=? AND sender=? AND state IN ('provisioning','active','closing') ORDER BY id DESC LIMIT 1", [$event['phone_number_id'],$message['from']]);
             if ($session && ($session['state']==='closing' || $timestamp >= (int)$session['last_inbound']+86400)) {
@@ -114,16 +120,13 @@ final class Bridge
                     return;
                 }
                 $name = Protocol::customerName($message['_name'] ?? 'WhatsApp customer');
-                // Bridge state is InnoDB: map event/session atomically before native writes.
-                $this->db->link->begin_transaction();
-                try {
-                    $this->db->insert('wa_sessions', ['did_id'=>$account['did_id'],'phone_number_id'=>$event['phone_number_id'],
-                        'sender'=>$message['from'],'group_id'=>$account['group_id'],'member'=>'wa'.bin2hex(random_bytes(9)),
-                        'member_name'=>$name,'last_inbound'=>$timestamp,'created_at'=>time()]);
-                    $id=$this->db->link->insert_id;
-                    $this->db->run('UPDATE wa_inbox SET session_id=? WHERE id=?', [$id,$event['id']]);
-                    $this->db->link->commit();
-                } catch (\Throwable $e) { $this->db->link->rollback(); throw $e; }
+                // The singleton worker serializes session creation. A stable member key
+                // makes the two writes recoverable on nontransactional storage engines.
+                $this->db->insert('wa_sessions', ['did_id'=>$account['did_id'],'phone_number_id'=>$event['phone_number_id'],
+                    'sender'=>$message['from'],'group_id'=>$account['group_id'],'member'=>$originMember,
+                    'member_name'=>$name,'last_inbound'=>$timestamp,'created_at'=>time()]);
+                $id=$this->db->link->insert_id;
+                $this->db->run('UPDATE wa_inbox SET session_id=? WHERE id=?', [$id,$event['id']]);
                 $session=$this->db->one('SELECT * FROM wa_sessions WHERE id=?', [$id]);
             } else {
                 $this->db->run('UPDATE wa_inbox SET session_id=? WHERE id=?', [$session['id'],$event['id']]);

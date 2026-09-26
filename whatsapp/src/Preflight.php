@@ -46,7 +46,9 @@ final class Preflight
         }
         foreach (['wa_sessions','wa_inbox','wa_outbox','wa_vici_operations'] as $table) {
             $status=$db->one('SHOW TABLE STATUS WHERE Name=?',[$table]);
-            if (strtolower($status['Engine'] ?? '')!=='innodb') { throw new \RuntimeException("$table must use InnoDB"); }
+            if (!in_array(strtolower($status['Engine'] ?? ''), ['innodb','myisam'], true)) {
+                throw new \RuntimeException("$table must use MyISAM or InnoDB");
+            }
         }
         $type=$db->columns('vicidial_chat_archive')['status']['Type'];
         foreach (['DROP',$config['archive_complete_status']] as $status) {
