@@ -24,3 +24,5 @@ The SSH private key stays on the laptop at `~/ssh_key_dialers`. This is the test
 - MySQL database: `asterisk`
 
 Confirm the remote repository checkout path before running Git commands.
+
+The test checkout is `/srv/www/htdocs/WA_chat`, with `/srv/www/htdocs/whatsapp` symlinked to its `whatsapp/` directory. `staff` has passwordless sudo on this test server. The `wa-chat` systemd service runs the worker as `apache` using `/usr/bin/php` and is enabled at boot. Use `sudo systemctl restart wa-chat` after updating worker code and `sudo journalctl -u wa-chat -f` for worker logs. The default `/usr/local/bin/php` lacks required extensions.
