@@ -41,4 +41,12 @@ check(WaChat\GraphClient::classify(429,0,'{"error":{"code":130429}}')['state'],'
 check(WaChat\GraphClient::classify(401,0,'{"error":{"code":190}}')['state'],'failed','Graph expired token rejected');
 check(WaChat\GraphClient::classify(500,0,'proxy error')['state'],'uncertain','Graph ambiguous proxy failure');
 check(WaChat\GraphClient::classify(200,0,'{}')['state'],'uncertain','Graph missing message ID');
+check(WaChat\GraphClient::mediaUrlAllowed('https://lookaside.fbsbx.com/file'),true,'Meta media host');
+check(WaChat\GraphClient::mediaUrlAllowed('https://lookaside.fbsbx.com.evil.test/file'),false,'host suffix attack rejected');
+check(WaChat\GraphClient::mediaUrlAllowed('https://scontent.whatsapp.net/file'),true,'WhatsApp media host');
+check(WaChat\GraphClient::mediaUrlAllowed('http://scontent.whatsapp.net/file'),false,'unencrypted media rejected');
+check(WaChat\GraphClient::mediaUrlAllowed('https://token@scontent.whatsapp.net/file'),false,'URL credentials rejected');
+check(WaChat\Media::extension('image/jpeg'),'jpg','safe image extension');
+check(WaChat\Media::extension('text/html'),null,'active document rejected');
+check(WaChat\Media::extension('audio/ogg; codecs=opus'),'ogg','voice MIME parameters');
 echo "PASS: $count unit checks\n";

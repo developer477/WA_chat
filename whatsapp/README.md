@@ -26,6 +26,14 @@ The example `TSIM`/number values above are documentation only. No business numbe
 
 ## Install
 
+For testing, connect from the development laptop:
+
+```sh
+ssh -C -i ~/ssh_key_dialers staff@deven024.cc.warmconnect.in
+```
+
+On this test server, VICIdial files are in `/srv/www/htdocs` and the MySQL database is `asterisk`. See [test server access](../README.md#test-server-access). Confirm the remote repository checkout path before running Git commands.
+
 1. Deploy `whatsapp/` alongside the existing `chat_customer/` directory. Copy `config.example.php` to `config.local.php` only if deployment paths/defaults need adjustment. The bridge **reuses `chat_customer/dbconnect_mysqli.php`** and `/etc/astguiclient.conf`; it refuses the sample fallback DB credentials if that config file is absent. It never connects to central PostgreSQL.
 2. Apply `sql/001_bridge.sql` to the VICIdial database with your normal DB administration process. It creates only four MyISAM bridge tables: sessions, inbox, outbox and a native-insert recovery journal. No VICIdial table/column changes or credential values are included.
 3. Configure the DID and chat-group fields above. Confirm existing custom fields are not used for another purpose. The target server must have the TEXT group fields described in #8186; this package does not widen them.
@@ -52,11 +60,23 @@ GET verification echoes the challenge only on an exact token match. POST uses HM
 
 Test first with a real message to `917045963025`, accept its queued chat in `TSIM`, and send an agent reply. Dashboard-generated test events alone do not verify that the real account subscription is connected. Sending/registration setup is outside the code migration: no live webhook or Meta account changes are made by installing the files.
 
+## Incoming media
+
+Images (JPEG/PNG), stickers (WebP), audio, video, PDF, plain text and supported Office documents are downloaded from Meta after the agent accepts the chat. The worker uses the receiving number's bearer token and verifies the downloaded SHA-256 against the webhook. Files are streamed with a 100 MiB ceiling (configurable with `media_max_bytes`), HTTPS-only Meta download URLs and no redirects. Customer filenames are display labels only; stored names are deterministic hashes with an allowed extension.
+
+Files live in `system_settings.sounds_web_directory/wa_media` under the web root. The bridge discovers that root by looking above the configured customer-chat directory for the existing sounds directory. This supports the test server's `/srv/www/htdocs` and `/var/www/htdocs` symlinked paths and nested checkout without hardcoding either path. For a different layout, set `media_web_root` in `config.local.php`. The worker user needs permission to create/write `wa_media`; no existing upload script or system setting is modified.
+
+The chat log receives a relative HTML attachment link, so no hostname is needed. Apache `.htaccess` rules in the generated media directory disable listing, deny dotfiles, and set download/nosniff headers when `mod_headers` is enabled. Apply equivalent rules if `.htaccess` is disabled or another web server is used. Links use the same unguessable-file-URL access model as existing web chat attachments; anyone with a link can download the file. Files remain available for archived chat links; there is no automatic deletion policy.
+
+Transient downloads retry up to eight times, reusing a verified saved file after interruptions. Permanent/exhausted failures insert an explanatory placeholder, retain the caption, and set the inbox to `failed` with a `media_*` error visible in `status.php`. Existing already-processed placeholder messages are not automatically replayed; send a new image to test after deployment. Agent-to-customer attachment URLs still go as text links; native outbound media upload is outside this change.
+
+Deploy the updated PHP files and restart the worker; no SQL migration is needed. Run `check.php` as the worker user to check media directory permissions.
+
 ## Message/session behavior
 
 - Webhook requests are authenticated and saved to the inbox before returning 200. Duplicate message IDs cannot create duplicate events. A DB failure returns 503 for retry; invalid signatures return 403. Batch messages and status events are handled separately. Unmapped numbers in a correctly signed account batch are ignored.
 - The worker follows the supplied customer-side SQL contract for lead creation, WAITING chats, participants, LIVE message insertion and keepalive. It uses the sender's full international number for lead lookup; it does not strip country codes or match national suffixes. Existing leads are reused without overwriting their name/email. Separate business numbers get separate chat sessions even for the same customer.
-- Waiting messages are held in the durable inbox until the chat becomes LIVE, including the initial customer message. Unsupported media types are retained in the event JSON and shown as a placeholder with any caption. Text/interactive/button replies are supported. This release expects numeric WhatsApp sender IDs; nonnumeric sender-identity formats require a future mapping extension and are rejected explicitly.
+- Waiting messages are held in the durable inbox until the chat becomes LIVE, including the initial customer message. Supported incoming media is downloaded and represented as an attachment link with its caption (see above). Other message types retain a placeholder. Text/interactive/button replies are supported. This release expects numeric WhatsApp sender IDs; nonnumeric sender-identity formats require a future mapping extension and are rejected explicitly.
 - Customer HTML is escaped, including the legacy pipe delimiter. Emoji are represented as numeric HTML entities in native chat rows to support older three-byte utf8 tables without loss. The bridge's own tables use utf8mb4.
 - Every active mapped customer receives keepalive updates. Only level-zero messages whose poster exists in `vicidial_users` are sent out; customer echoes, private notes and COUNTRY AND IP ADDRESS metadata are excluded. Transfers do not change the originating WhatsApp number. Agent HTML is converted to plain text, preserving HTTP(S) links. Long replies split into ordered 4,000-character parts. No new translation logic is introduced; the message stored for the customer is used.
 - Both live and archived logs are checked so a final reply can be picked up after agent closure. Each source message/part has a unique outbox key. A changed message after it was already sent does **not** produce a second WhatsApp message. Confirm your translation code stores the final customer-facing text before it is eligible for delivery, just as the customer polling interface expects.

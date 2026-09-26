@@ -215,6 +215,65 @@ try {
     $bridge->tick();
     eq((int)$db->one('SELECT COUNT(*) AS n FROM wa_sessions WHERE sender=?',[$origin['from']])['n'],1,'closed origin session is not recreated');
     eq($db->one('SELECT state FROM wa_inbox WHERE id=?',[$originEvent['id']])['state'],'closed','closed origin event is terminal');
+    // Media uses the existing attachment directory and native chat log, with no schema migration.
+    $mediaRoot=sys_get_temp_dir().'/wa-media-test-'.bin2hex(random_bytes(6));
+    mkdir($mediaRoot.'/attachments',0755,true); mkdir($mediaRoot.'/checkout/chat_customer',0755,true);
+    $db->run("ALTER TABLE system_settings ADD sounds_web_directory VARCHAR(255) DEFAULT 'attachments'");
+    $mediaConfig=$config; $mediaConfig['chat_directory']=$mediaRoot.'/checkout/chat_customer';
+    $download=new class implements \WaChat\MediaDownloader {
+        public int $calls=0;
+        public bool $fail=false;
+        public bool $corrupt=false;
+        public function download(array $account,string $id,string $path,int $limit): array {
+            $this->calls++;
+            if ($this->fail) { throw new \WaChat\MediaFailure('media_transport',true); }
+            file_put_contents($path,$this->corrupt?'corrupt':'test image bytes');
+            return ['mime_type'=>'image/png'];
+        }
+    };
+    $media=new \WaChat\Media($db,$mediaConfig,$download);
+    eq($media->location(),[realpath($mediaRoot).'/attachments/wa_media','/attachments/wa_media'],'discover web root above nested checkout');
+    $mediaBridge=new Bridge($db,$sender,$mediaConfig,$media);
+    $image=message('media.1',''); $image['from']='919812349999'; $image['type']='image'; unset($image['text']);
+    $image['image']=['id'=>'123456','mime_type'=>'image/png','sha256'=>base64_encode(hash('sha256','test image bytes',true)),
+        'caption'=>'Receipt <script>alert(1)</script> 😀','filename'=>'../../evil.php'];
+    receive($webhook,envelope([$image])); $mediaBridge->tick();
+    $mediaSession=$db->one('SELECT * FROM wa_sessions WHERE sender=?',[$image['from']]);
+    eq($download->calls,0,'do not download before agent accepts');
+    $db->run("UPDATE vicidial_live_chats SET status='LIVE',chat_creator='agent1' WHERE chat_id=?",[$mediaSession['chat_id']]);
+    $db->run('UPDATE wa_inbox SET next_attempt=0'); $mediaBridge->tick();
+    $mediaLog=$db->one('SELECT message FROM vicidial_chat_log WHERE chat_id=?',[$mediaSession['chat_id']])['message'];
+    eq(strpos($mediaLog,'<a href="/attachments/wa_media/')===0,true,'media link written to native chat');
+    eq(strpos($mediaLog,'<script>'),false,'caption HTML escaped');
+    eq(count(glob($mediaRoot.'/attachments/wa_media/*.png')),1,'safe filename and extension');
+    eq($download->calls,1,'one download');
+    receive($webhook,envelope([$image])); $mediaBridge->tick();
+    eq((int)$db->one('SELECT COUNT(*) AS n FROM vicidial_chat_log WHERE chat_id=?',[$mediaSession['chat_id']])['n'],1,'duplicate callback does not duplicate media log');
+    $account=(new \WaChat\Accounts($db))->all()['773505685855835'];
+    $media->html($image,$account); eq($download->calls,1,'cached file reused after interrupted insertion');
+    $image['id']='media.retry'; $image['image']['id']='123457'; $download->fail=true;
+    receive($webhook,envelope([$image])); $mediaBridge->tick();
+    $event=$db->one("SELECT * FROM wa_inbox ORDER BY id DESC LIMIT 1");
+    eq($event['state'],'retry','transient download failure retained');
+    eq($event['error_code'],'media_transport','useful media error without secrets');
+    $download->fail=false; $db->run('UPDATE wa_inbox SET next_attempt=0'); $mediaBridge->tick();
+    eq($db->one('SELECT state FROM wa_inbox WHERE id=?',[$event['id']])['state'],'done','media retry delivered');
+    $image['id']='media.hash'; $image['image']['id']='123458'; $download->corrupt=true;
+    receive($webhook,envelope([$image])); $mediaBridge->tick();
+    $event=$db->one("SELECT * FROM wa_inbox ORDER BY id DESC LIMIT 1");
+    eq($event['error_code'],'media_hash_mismatch','corrupt download rejected');
+    eq(count(glob($mediaRoot.'/attachments/wa_media/.download-*')),0,'partial files cleaned');
+    $db->run('UPDATE wa_inbox SET attempts=7,next_attempt=0 WHERE id=?',[$event['id']]); $mediaBridge->tick();
+    eq($db->one('SELECT state FROM wa_inbox WHERE id=?',[$event['id']])['state'],'failed','download retries bounded');
+    $last=$db->one('SELECT message FROM vicidial_chat_log WHERE chat_id=? ORDER BY message_row_id DESC LIMIT 1',[$mediaSession['chat_id']]);
+    eq(strpos($last['message'],'media_hash_mismatch')!==false,true,'agent sees failed attachment');
+    $download->corrupt=false;
+    $image['image']['mime_type']='text/html';
+    try { $media->html($image,$account); throw new RuntimeException('unsafe MIME accepted'); }
+    catch (\WaChat\MediaFailure $e) { eq($e->reason,'media_unsupported_type','reject active media'); }
+    foreach (glob($mediaRoot.'/attachments/wa_media/*') as $file) { unlink($file); }
+    unlink($mediaRoot.'/attachments/wa_media/.htaccess'); rmdir($mediaRoot.'/attachments/wa_media');
+    rmdir($mediaRoot.'/attachments'); rmdir($mediaRoot.'/checkout/chat_customer'); rmdir($mediaRoot.'/checkout'); rmdir($mediaRoot);
     $engine=in_array('--innodb',$argv,true)?'InnoDB':'MyISAM';
     echo "PASS: $count MariaDB integration checks ($engine native and bridge tables)\n";
 } finally {

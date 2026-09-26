@@ -7,4 +7,7 @@ return [
     // Must be accepted by vicidial_chat_archive.status. check.php validates it.
     'archive_complete_status' => 'DEAD',
     'batch_size' => 100,
+    // null discovers the web root by locating sounds_web_directory above chat_directory.
+    'media_web_root' => null,
+    'media_max_bytes' => 104857600,
 ];

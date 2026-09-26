@@ -6,7 +6,7 @@ interface Sender
     public function send(array $account, string $recipient, string $body, int $outboxId): array;
 }
 
-final class GraphClient implements Sender
+final class GraphClient implements Sender, MediaDownloader
 {
     private string $version;
     public function __construct(string $version)
@@ -46,5 +46,52 @@ final class GraphClient implements Sender
         // A definite Graph rejection is safe to surface as failed; malformed/5xx replies are ambiguous.
         if ($code && $http >= 400 && $http < 500) { return ['state'=>'failed','error'=>'meta_' . $code]; }
         return ['state'=>'uncertain','error'=>'http_' . $http];
+    }
+
+    public static function mediaUrlAllowed(string $url): bool
+    {
+        $parts=parse_url($url);
+        $host=strtolower($parts['host'] ?? '');
+        return ($parts['scheme'] ?? '')==='https' && !isset($parts['user']) && !isset($parts['pass'])
+            && (!isset($parts['port']) || $parts['port']===443)
+            && (bool)preg_match('/(^|\.)(facebook\.com|fbcdn\.net|fbsbx\.com|whatsapp\.net)$/D',$host);
+    }
+
+    public function download(array $account, string $id, string $path, int $limit): array
+    {
+        if (!ctype_digit($id)) { throw new MediaFailure('media_invalid_id'); }
+        $url='https://graph.facebook.com/'.$this->version.'/'.$id.'?phone_number_id='.rawurlencode($account['phone_number_id']);
+        $metadata=$this->mediaGet($url,$account['token'],null,65536);
+        $data=json_decode($metadata,true);
+        if (!is_array($data) || !self::mediaUrlAllowed($data['url'] ?? '')) { throw new MediaFailure('media_invalid_url'); }
+        if ((int)($data['file_size'] ?? 0)>$limit) { throw new MediaFailure('media_too_large'); }
+        $file=fopen($path,'wb');
+        if ($file===false) { throw new MediaFailure('media_storage_failure',true); }
+        try { $this->mediaGet($data['url'],$account['token'],$file,$limit); }
+        finally { fclose($file); }
+        return $data;
+    }
+
+    private function mediaGet(string $url, string $token, $file, int $limit): string
+    {
+        $body=''; $bytes=0; $tooLarge=false;
+        $curl=curl_init($url);
+        curl_setopt_array($curl,[CURLOPT_HTTPHEADER=>['Authorization: Bearer '.$token],
+            CURLOPT_CONNECTTIMEOUT=>5,CURLOPT_TIMEOUT=>30,CURLOPT_FOLLOWLOCATION=>false,
+            CURLOPT_PROTOCOLS=>CURLPROTO_HTTPS,
+            CURLOPT_WRITEFUNCTION=>function ($curl,string $chunk) use ($file,$limit,&$body,&$bytes,&$tooLarge): int {
+                $bytes+=strlen($chunk);
+                if ($bytes>$limit) { $tooLarge=true; return 0; }
+                if ($file!==null) { return (int)fwrite($file,$chunk); }
+                $body.=$chunk; return strlen($chunk);
+            }]);
+        $ok=curl_exec($curl); $errno=curl_errno($curl); $http=(int)curl_getinfo($curl,CURLINFO_HTTP_CODE);
+        unset($curl);
+        if ($tooLarge) { throw new MediaFailure('media_too_large'); }
+        if ($ok===false || $errno) { throw new MediaFailure('media_transport',true); }
+        if ($http<200 || $http>=300) {
+            throw new MediaFailure('media_http_'.$http,$http===429 || $http>=500 || $http===404);
+        }
+        return $body;
     }
 }

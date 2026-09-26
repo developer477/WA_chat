@@ -9,11 +9,13 @@ final class Bridge
     private array $config;
     private string $logKey;
     private int $lastHeartbeat = 0;
+    private ?Media $media;
 
-    public function __construct(Database $db, Sender $sender, array $config)
+    public function __construct(Database $db, Sender $sender, array $config, ?Media $media = null)
     {
         $this->db=$db; $this->accounts=new Accounts($db); $this->sender=$sender; $this->config=$config;
         $this->logKey=$db->primary('vicidial_chat_log');
+        $this->media=$media ?? ($sender instanceof MediaDownloader ? new Media($db,$config,$sender) : null);
     }
 
     public function recover(): void
@@ -167,11 +169,26 @@ final class Bridge
             return;
         }
         $text=Protocol::messageText($message);
+        $html=Protocol::customerHtml($text);
+        $mediaError=null;
+        if (Media::supports($message) && $this->media) {
+            try { $html=$this->media->html($message,$account); }
+            catch (MediaFailure $e) {
+                if ($e->retryable && (int)$event['attempts']<7) {
+                    $this->db->run("UPDATE wa_inbox SET state='retry',attempts=attempts+1,next_attempt=?,error_code=? WHERE id=?",
+                        [time()+30,$e->reason,$event['id']]);
+                    return;
+                }
+                $mediaError=$e->reason;
+                $caption=$message[$message['type']]['caption'] ?? '';
+                $html=Protocol::customerHtml('[WhatsApp '.$message['type'].' unavailable: '.$e->reason.']'.($caption!==''?"\n".$caption:''));
+            }
+        }
         $this->db->nativeInsert('inbox:'.$event['id'], 'vicidial_chat_log', [
-            'chat_id'=>$session['chat_id'], 'message'=>Protocol::customerHtml($text),
+            'chat_id'=>$session['chat_id'], 'message'=>$html,
             'poster'=>$session['member'],'chat_member_name'=>$session['member_name'],'chat_level'=>0,
             'message_time'=>$this->db->timestamp($timestamp)], 'vicidial_chat_log_archive');
-        $this->db->run("UPDATE wa_inbox SET state='done',error_code=NULL WHERE id=?", [$event['id']]);
+        $this->db->run("UPDATE wa_inbox SET state=?,error_code=? WHERE id=?", [$mediaError?'failed':'done',$mediaError,$event['id']]);
     }
 
     private function provision(array $session, array $account): array
