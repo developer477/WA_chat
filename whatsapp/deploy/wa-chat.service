@@ -1,0 +1,18 @@
+[Unit]
+Description=WhatsApp VICIdial customer bridge
+After=network.target mariadb.service
+
+[Service]
+Type=simple
+# Adjust these deployment paths/user to your VICIdial installation.
+User=wwwrun
+WorkingDirectory=/srv/www/htdocs/whatsapp
+ExecStart=/usr/bin/php /srv/www/htdocs/whatsapp/worker.php
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
