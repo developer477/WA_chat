@@ -75,8 +75,9 @@ final class Database
     /** Reserve a native primary key in a durable journal BEFORE inserting.
      * Table locks also serialize ordinary agent inserts; no MyISAM rollback is assumed.
      * If a crash lets another writer take a reserved ID, allocate a new one on replay.
+     * alreadyLocked is used by customer departure, which holds all the above locks.
      */
-    public function nativeInsert(string $key, string $table, array $values, ?string $archive = null): int
+    public function nativeInsert(string $key, string $table, array $values, ?string $archive = null, bool $alreadyLocked = false): int
     {
         $pk = $this->primary($table);
         $t = self::ident($table);
@@ -85,7 +86,7 @@ final class Database
         if ($archive) {
             $locks .= ', ' . self::ident($archive) . ' READ';
         }
-        $this->run('LOCK TABLES ' . $locks);
+        if (!$alreadyLocked) { $this->run('LOCK TABLES ' . $locks); }
         try {
             $op = $this->one('SELECT * FROM wa_vici_operations WHERE operation_key=?', [$key]);
             if ($op && $op['target_table'] !== $table) {
@@ -131,7 +132,7 @@ final class Database
             $this->run("UPDATE wa_vici_operations SET state='done' WHERE operation_key=?", [$key]);
             return $id;
         } finally {
-            $this->run('UNLOCK TABLES');
+            if (!$alreadyLocked) { $this->run('UNLOCK TABLES'); }
         }
     }
 }

@@ -28,8 +28,8 @@ CREATE TABLE vicidial_chat_log (
  poster VARCHAR(20),chat_member_name VARCHAR(50),chat_level INT,KEY chat(chat_id)
 ) ENGINE=MyISAM DEFAULT CHARSET=utf8mb3;
 CREATE TABLE vicidial_chat_log_archive LIKE vicidial_chat_log;
-CREATE TABLE vicidial_users (user VARCHAR(20) PRIMARY KEY) ENGINE=MyISAM;
+CREATE TABLE vicidial_users (user VARCHAR(20) PRIMARY KEY, full_name VARCHAR(50)) ENGINE=MyISAM;
 CREATE TABLE chat_id_lead (chat_id INT PRIMARY KEY,status VARCHAR(20)) ENGINE=MyISAM;
-INSERT INTO vicidial_users VALUES ('agent1'),('agent2');
+INSERT INTO vicidial_users VALUES ('agent1','Agent One'),('agent2','Agent Two');
 INSERT INTO vicidial_inbound_groups VALUES ('TSIM','Y','CHAT',999,REPEAT('x',202),REPEAT('a',32),'test-verification');
 INSERT INTO vicidial_inbound_dids VALUES (12,'917045963025','Y','TSIM','773505685855835'),(13,'919999999999','Y','TSIM','773505685855836');

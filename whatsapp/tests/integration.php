@@ -42,6 +42,7 @@ function receive(Webhook $webhook,string $body): void {
 }
 try {
     loadSql($link,__DIR__.'/schema.sql'); loadSql($link,dirname(__DIR__).'/sql/001_bridge.sql');
+    loadSql($link,dirname(__DIR__).'/sql/002_reply_cursor.sql');
     $db=new Database($link); $config=require dirname(__DIR__).'/config.example.php';
     eq(count(Preflight::check($db,$config)),2,'two numbers share group');
     $sender=new FakeSender(); $bridge=new Bridge($db,$sender,$config); $webhook=new Webhook($db);
@@ -55,17 +56,17 @@ try {
     $session=$db->one('SELECT * FROM wa_sessions ORDER BY id LIMIT 1');
     eq($session['state'],'active','provisioned');
     eq($db->one('SELECT state FROM wa_inbox')['state'],'waiting','message held while waiting');
-    eq((int)$db->one('SELECT COUNT(*) AS n FROM vicidial_chat_log')['n'],0,'no rejected/lost waiting message');
+    eq((int)$db->one('SELECT COUNT(*) AS n FROM vicidial_chat_log WHERE chat_level=0')['n'],0,'no rejected/lost waiting message');
     $chat=$session['chat_id'];
     $db->run("UPDATE vicidial_live_chats SET status='LIVE',chat_creator='agent1' WHERE chat_id=?",[$chat]);
     $db->run('UPDATE wa_inbox SET next_attempt=0'); $bridge->tick();
     eq($db->one('SELECT state FROM wa_inbox')['state'],'done','waiting message delivered');
-    eq((int)$db->one('SELECT COUNT(*) AS n FROM vicidial_chat_log')['n'],1,'one customer message');
-    $stored=$db->one('SELECT message FROM vicidial_chat_log')['message'];
+    eq((int)$db->one('SELECT COUNT(*) AS n FROM vicidial_chat_log WHERE chat_level=0')['n'],1,'one customer message');
+    $stored=$db->one('SELECT message FROM vicidial_chat_log WHERE chat_level=0')['message'];
     eq(strpos($stored,'<script>'),false,'customer HTML not executable');
     eq(strpos($stored,'&#128512;')!==false,true,'emoji retained in legacy utf8');
     receive($webhook,$body); $bridge->tick();
-    eq((int)$db->one('SELECT COUNT(*) AS n FROM vicidial_chat_log')['n'],1,'no duplicate native message');
+    eq((int)$db->one('SELECT COUNT(*) AS n FROM vicidial_chat_log WHERE chat_level=0')['n'],1,'no duplicate native message');
     foreach ([['agent1',0,'Hello<br>there'],['agent1',1,'PRIVATE'],[$session['member'],0,'ECHO'],['system',0,'SYSTEM']] as $row) {
         $db->insert('vicidial_chat_log',['chat_id'=>$chat,'message'=>$row[2],'message_time'=>date('Y-m-d H:i:s'),'poster'=>$row[0],'chat_member_name'=>'Name','chat_level'=>$row[1]]);
     }
@@ -113,20 +114,41 @@ try {
     $db->run('DELETE FROM vicidial_live_chats WHERE chat_id=?',[$chat]);
     $bridge->tick(); eq(end($sender->calls)[2],'Final reply','final archived reply delivered');
     eq($db->one('SELECT state FROM wa_sessions WHERE id=1')['state'],'closed','agent close detected');
-    // Existing remaining live session reaches exact 24-hour expiry.
+    // Quiet chats survive the 24-hour boundary. No timer-driven departure.
     $db->run('UPDATE wa_sessions SET last_inbound=? WHERE id=2',[time()-86400]);
+    $db->insert('vicidial_chat_participants',['chat_id'=>$second['chat_id'],'chat_member'=>'agent1','chat_member_name'=>'Agent One','vd_agent'=>'Y','ping_date'=>date('Y-m-d H:i:s')]);
     $bridge->tick();
-    eq($db->one('SELECT state FROM wa_sessions WHERE id=2')['state'],'closed','expiry complete');
-    eq($db->one('SELECT chat_id FROM vicidial_live_chats WHERE chat_id=?',[$second['chat_id']]),null,'expired live row removed');
-    eq($db->one('SELECT status FROM vicidial_chat_archive WHERE chat_id=?',[$second['chat_id']])['status'],'DEAD','expiry archived');
-    eq((int)$db->one('SELECT COUNT(*) AS n FROM vicidial_chat_participants WHERE chat_id=?',[$second['chat_id']])['n'],0,'expired participants removed');
+    eq($db->one('SELECT state FROM wa_sessions WHERE id=2')['state'],'active','idle session not expired');
+    eq($db->one('SELECT status FROM vicidial_live_chats WHERE chat_id=?',[$second['chat_id']])['status'],'LIVE','idle live chat retained');
+    // A real outgoing message at the boundary triggers customer departure only.
+    $before=count($sender->calls);
+    $db->insert('vicidial_chat_log',['chat_id'=>$second['chat_id'],'message'=>'Too late','message_time'=>date('Y-m-d H:i:s'),'poster'=>'agent1','chat_member_name'=>'Agent','chat_level'=>0]);
+    $bridge->tick();
+    eq(count($sender->calls),$before,'expired outbound not sent');
+    eq($db->one('SELECT state FROM wa_sessions WHERE id=2')['state'],'closed','outbound triggers departure');
+    eq($db->one('SELECT status FROM vicidial_live_chats WHERE chat_id=?',[$second['chat_id']])['status'],'LIVE','agent live row preserved');
+    eq($db->one('SELECT chat_id FROM vicidial_chat_archive WHERE chat_id=?',[$second['chat_id']]),null,'agent chat not archived by customer');
+    eq((int)$db->one("SELECT COUNT(*) AS n FROM vicidial_chat_participants WHERE chat_id=? AND vd_agent='Y'",[$second['chat_id']])['n'],1,'agent participant preserved');
+    eq((int)$db->one("SELECT COUNT(*) AS n FROM vicidial_chat_participants WHERE chat_id=? AND vd_agent='N'",[$second['chat_id']])['n'],0,'only customer participant removed');
+    eq((int)$db->one("SELECT COUNT(*) AS n FROM vicidial_chat_log WHERE chat_id=? AND chat_level=1 AND message LIKE '%has left chat'",[$second['chat_id']])['n'],1,'one private leave notice');
+    $bridge->close($second,'window_expired'); $bridge->tick();
+    eq((int)$db->one("SELECT COUNT(*) AS n FROM vicidial_chat_log WHERE chat_id=? AND chat_level=1 AND message LIKE '%has left chat'",[$second['chat_id']])['n'],1,'departure replay does not repeat notice');
     receive($webhook,envelope([message('after.close','New conversation')],[],'773505685855836')); $bridge->tick();
-    eq((int)$db->one('SELECT COUNT(*) AS n FROM wa_sessions')['n'],3,'new chat after expiry');
+    eq((int)$db->one('SELECT COUNT(*) AS n FROM wa_sessions')['n'],3,'new chat after departure');
     $third=$db->one('SELECT * FROM wa_sessions WHERE id=3');
     $db->run('UPDATE wa_sessions SET last_inbound=? WHERE id=3',[time()-86400]);
     $bridge->tick();
-    eq($db->one('SELECT status FROM vicidial_chat_archive WHERE chat_id=?',[$third['chat_id']])['status'],'DROP','waiting expiry drop');
-    eq($db->one('SELECT state FROM wa_inbox ORDER BY id DESC LIMIT 1')['state'],'expired','waiting message retained as expired');
+    eq($db->one('SELECT state FROM wa_sessions WHERE id=3')['state'],'active','buffered waiting message does not cause timed expiry');
+    // Incoming message after the gap drops an unclaimed chat and starts a new one.
+    receive($webhook,envelope([message('after.waiting','Fresh message')],[],'773505685855836')); $bridge->tick();
+    eq($db->one('SELECT status FROM vicidial_chat_archive WHERE chat_id=?',[$third['chat_id']])['status'],'DROP','incoming triggers waiting DROP');
+    eq($db->one('SELECT chat_id FROM vicidial_live_chats WHERE chat_id=?',[$third['chat_id']]),null,'unclaimed live row removed');
+    eq($db->one('SELECT state FROM wa_inbox WHERE session_id=? ORDER BY id LIMIT 1',[$third['id']])['state'],'expired','old buffered message expired');
+    $fresh=$db->one('SELECT * FROM wa_sessions ORDER BY id DESC LIMIT 1');
+    eq($fresh['state'],'active','fresh inbound creates new session');
+    eq((int)$db->one("SELECT COUNT(*) AS n FROM vicidial_chat_log WHERE chat_id=? AND chat_level=1 AND message LIKE '%Receiving number: +919999999999'",[$fresh['chat_id']])['n'],1,'receiving number information once on new chat');
+    // Drop the test's fresh waiting chat so the ordering scenario starts cleanly.
+    $bridge->close($fresh,'window_expired');
     // Startup recovery must not resubmit in-flight operations.
     $db->run("UPDATE wa_outbox SET state='sending' WHERE id=1"); $bridge->recover();
     eq($db->one('SELECT state FROM wa_outbox WHERE id=1')['state'],'uncertain','restart send recovery');
@@ -137,7 +159,7 @@ try {
     receive($webhook,envelope([message('ordered.2','Second buffered')],[],'773505685855836'));
     $db->run('UPDATE wa_inbox SET next_attempt=0'); $bridge->tick();
     $db->run('UPDATE wa_inbox SET next_attempt=0'); $bridge->tick();
-    $texts=$db->all('SELECT message FROM vicidial_chat_log WHERE chat_id=? ORDER BY message_row_id',[$ordered['chat_id']]);
+    $texts=$db->all('SELECT message FROM vicidial_chat_log WHERE chat_id=? AND chat_level=0 ORDER BY message_row_id',[$ordered['chat_id']]);
     eq(array_column($texts,'message'),['First buffered','Second buffered'],'buffered message order');
     // Definite transient failure retries only when due; credential rotation is read live.
     $db->insert('vicidial_chat_log',['chat_id'=>$ordered['chat_id'],'message'=>'Retry reply','message_time'=>date('Y-m-d H:i:s'),'poster'=>'agent1','chat_member_name'=>'Agent','chat_level'=>0]);
@@ -215,6 +237,96 @@ try {
     $bridge->tick();
     eq((int)$db->one('SELECT COUNT(*) AS n FROM wa_sessions WHERE sender=?',[$origin['from']])['n'],1,'closed origin session is not recreated');
     eq($db->one('SELECT state FROM wa_inbox WHERE id=?',[$originEvent['id']])['state'],'closed','closed origin event is terminal');
+    // Incoming after 24h leaves an agent-owned chat intact and starts a fresh one.
+    $late=message('late.live.1','Initial'); $late['from']='919812341111';
+    receive($webhook,envelope([$late])); $bridge->tick();
+    $old=$db->one('SELECT * FROM wa_sessions WHERE sender=? ORDER BY id DESC LIMIT 1',[$late['from']]);
+    $db->run("UPDATE vicidial_live_chats SET status='LIVE',chat_creator='agent1' WHERE chat_id=?",[$old['chat_id']]);
+    $db->run('UPDATE wa_inbox SET next_attempt=0'); $bridge->tick();
+    $db->run('UPDATE wa_sessions SET last_inbound=? WHERE id=?',[time()-86400,$old['id']]);
+    $late['id']='late.live.2'; receive($webhook,envelope([$late])); $bridge->tick();
+    eq($db->one('SELECT state FROM wa_sessions WHERE id=?',[$old['id']])['state'],'closed','incoming after gap leaves old session');
+    eq($db->one('SELECT status FROM vicidial_live_chats WHERE chat_id=?',[$old['chat_id']])['status'],'LIVE','incoming does not close agent chat');
+    $renewed=$db->one('SELECT * FROM wa_sessions WHERE sender=? ORDER BY id DESC LIMIT 1',[$late['from']]);
+    eq($renewed['chat_id']!==$old['chat_id'],true,'incoming starts distinct new chat after gap');
+    // Interruption after recording a leave notice is safely finished on startup.
+    $db->run("UPDATE vicidial_live_chats SET status='LIVE',chat_creator='agent1' WHERE chat_id=?",[$renewed['chat_id']]);
+    $db->run('UPDATE wa_inbox SET next_attempt=0'); $bridge->tick();
+    $db->run("CREATE TRIGGER wa_test_leave_failure BEFORE DELETE ON vicidial_chat_participants FOR EACH ROW BEGIN IF OLD.chat_id=".(int)$renewed['chat_id']." THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected leave failure'; END IF; END");
+    try { $bridge->close($renewed,'window_expired'); throw new RuntimeException('leave failure not injected'); }
+    catch (mysqli_sql_exception $e) { eq($e->getCode(),1644,'departure interrupted after notice'); }
+    $db->run('DROP TRIGGER wa_test_leave_failure');
+    $bridge=new Bridge($db,$sender,$config); $bridge->recover();
+    eq($db->one('SELECT state FROM wa_sessions WHERE id=?',[$renewed['id']])['state'],'closed','unfinished departure recovered');
+    eq((int)$db->one("SELECT COUNT(*) AS n FROM vicidial_chat_log WHERE chat_id=? AND message LIKE '%has left chat'",[$renewed['chat_id']])['n'],1,'recovered departure notice exactly once');
+    eq($db->one('SELECT status FROM vicidial_live_chats WHERE chat_id=?',[$renewed['chat_id']])['status'],'LIVE','recovery retains agent chat');
+
+    // Cursor advancement waits for every outbox part, even on MyISAM failures.
+    $db->insert('vicidial_chat_log',['chat_id'=>$ordered['chat_id'],'message'=>str_repeat('z',4001),'message_time'=>date('Y-m-d H:i:s'),'poster'=>'agent1','chat_member_name'=>'Agent','chat_level'=>0]);
+    $source=(int)$db->link->insert_id;
+    $db->run("CREATE TRIGGER wa_test_outbox_failure BEFORE INSERT ON wa_outbox FOR EACH ROW BEGIN IF NEW.source_id=$source AND NEW.part=1 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected queue failure'; END IF; END");
+    $cursorBefore=$db->one("SELECT last_id FROM wa_worker_state WHERE name='chat_log'")['last_id'];
+    try { $bridge->tick(); throw new RuntimeException('queue failure not injected'); }
+    catch (mysqli_sql_exception $e) { eq($e->getCode(),1644,'outbox part failure injected'); }
+    eq($db->one("SELECT last_id FROM wa_worker_state WHERE name='chat_log'")['last_id'],$cursorBefore,'cursor not advanced after partial queue write');
+    $db->run('DROP TRIGGER wa_test_outbox_failure');
+    $bridge=new Bridge($db,$sender,$config); $bridge->recover(); $bridge->tick(); $bridge->tick();
+    eq((int)$db->one('SELECT COUNT(*) AS n FROM wa_outbox WHERE source_id=?',[$source])['n'],2,'restart completes parts without duplicates');
+    // Do not advance past replies while a new native chat's mapping is incomplete.
+    $db->insert('wa_sessions',['did_id'=>12,'phone_number_id'=>'773505685855835','sender'=>'incomplete','group_id'=>'TSIM',
+        'member'=>'incomplete','member_name'=>'Incomplete','created_at'=>time(),'last_inbound'=>time()]);
+    $db->insert('vicidial_chat_log',['chat_id'=>$ordered['chat_id'],'message'=>'After provisioning','message_time'=>date('Y-m-d H:i:s'),'poster'=>'agent1','chat_member_name'=>'Agent','chat_level'=>0]);
+    $cursorBefore=$db->one("SELECT last_id FROM wa_worker_state WHERE name='chat_log'")['last_id'];
+    $bridge->tick();
+    eq($db->one("SELECT last_id FROM wa_worker_state WHERE name='chat_log'")['last_id'],$cursorBefore,'unfinished chat mapping holds cursor');
+    $db->run("DELETE FROM wa_sessions WHERE member='incomplete'"); $bridge->tick();
+    eq(end($sender->calls)[2],'After provisioning','cursor resumes after provisioning recovery');
+    // A later archive move below the cursor must not resend a processed reply.
+    $before=count($sender->calls);
+    $db->run('INSERT INTO vicidial_chat_log_archive SELECT * FROM vicidial_chat_log WHERE message_row_id=?',[$source]);
+    $db->run('DELETE FROM vicidial_chat_log WHERE message_row_id=?',[$source]); $bridge->tick();
+    eq(count($sender->calls),$before,'late archival does not resend old reply');
+
+    // A small cursor batch still picks up a reply archived between worker ticks.
+    $configSmall=$config; $configSmall['reply_batch_size']=1;
+    $poller=new Bridge($db,$sender,$configSmall);
+    $before=count($sender->calls);
+    for ($n=0;$n<3;$n++) {
+        $db->insert('vicidial_chat_log',['chat_id'=>$ordered['chat_id'],'message'=>'Page '.$n,'message_time'=>date('Y-m-d H:i:s'),'poster'=>'agent1','chat_member_name'=>'Agent','chat_level'=>0]);
+        if ($n===0) {
+            $id=(int)$db->link->insert_id;
+            $db->run('INSERT INTO vicidial_chat_log_archive SELECT * FROM vicidial_chat_log WHERE message_row_id=?',[$id]);
+            $db->run('DELETE FROM vicidial_chat_log WHERE message_row_id=?',[$id]);
+        }
+    }
+    $poller->tick(); $poller->tick(); $poller->tick();
+    eq(array_column(array_slice($sender->calls,$before),2),['Page 0','Page 1','Page 2'],'shared cursor orders live and archived batches');
+
+    // A pending recent customer message defers expiry of an actual agent reply.
+    $db->run('UPDATE wa_sessions SET last_inbound=? WHERE id=?',[time()-86400,$ordered['id']]);
+    $deferred=message('deferred.new','Still here',-20);
+    receive($webhook,envelope([$deferred],[],'773505685855836'));
+    $db->run('UPDATE wa_inbox SET next_attempt=? WHERE event_key=?',[time()+60,hash('sha256','773505685855836:message:deferred.new')]);
+    $db->insert('vicidial_chat_log',['chat_id'=>$ordered['chat_id'],'message'=>'After backlog','message_time'=>date('Y-m-d H:i:s'),'poster'=>'agent1','chat_member_name'=>'Agent','chat_level'=>0]);
+    $before=count($sender->calls); $bridge->tick();
+    eq($db->one('SELECT state FROM wa_sessions WHERE id=?',[$ordered['id']])['state'],'active','pending inbound avoids false outbound expiry');
+    eq(count($sender->calls),$before,'outbound waits for pending inbound');
+    $db->run('UPDATE wa_inbox SET next_attempt=0'); $bridge->tick();
+    eq(count($sender->calls),$before+1,'send resumes after recent customer event');
+
+    // With no message work, query count is independent of the number of sessions.
+    $bridge->tick();
+    $before=(int)$db->one("SHOW SESSION STATUS LIKE 'Com_select'")['Value']; $bridge->tick();
+    $quietQueries=(int)$db->one("SHOW SESSION STATUS LIKE 'Com_select'")['Value']-$before;
+    for ($n=0;$n<200;$n++) {
+        $db->insert('wa_sessions',['did_id'=>12,'phone_number_id'=>'773505685855835','sender'=>'quiet'.$n,'group_id'=>'TSIM',
+            'member'=>'quiet'.$n,'member_name'=>'Quiet','state'=>'active','created_at'=>time()-90000,'last_inbound'=>time()-90000]);
+    }
+    $before=(int)$db->one("SHOW SESSION STATUS LIKE 'Com_select'")['Value']; $bridge->tick();
+    eq((int)$db->one("SHOW SESSION STATUS LIKE 'Com_select'")['Value']-$before,$quietQueries,'idle SELECT count independent of 200 more sessions');
+    eq((int)$db->one("SELECT COUNT(*) AS n FROM wa_sessions WHERE member LIKE 'quiet%' AND state='active'")['n'],200,'quiet expired sessions untouched');
+    $db->run("DELETE FROM wa_sessions WHERE member LIKE 'quiet%'");
+
     // Media uses the existing attachment directory and native chat log, with no schema migration.
     $mediaRoot=sys_get_temp_dir().'/wa-media-test-'.bin2hex(random_bytes(6));
     mkdir($mediaRoot.'/attachments',0755,true); mkdir($mediaRoot.'/checkout/chat_customer',0755,true);
@@ -242,13 +354,13 @@ try {
     eq($download->calls,0,'do not download before agent accepts');
     $db->run("UPDATE vicidial_live_chats SET status='LIVE',chat_creator='agent1' WHERE chat_id=?",[$mediaSession['chat_id']]);
     $db->run('UPDATE wa_inbox SET next_attempt=0'); $mediaBridge->tick();
-    $mediaLog=$db->one('SELECT message FROM vicidial_chat_log WHERE chat_id=?',[$mediaSession['chat_id']])['message'];
+    $mediaLog=$db->one('SELECT message FROM vicidial_chat_log WHERE chat_id=? AND chat_level=0',[$mediaSession['chat_id']])['message'];
     eq(strpos($mediaLog,'<a href="/attachments/wa_media/')===0,true,'media link written to native chat');
     eq(strpos($mediaLog,'<script>'),false,'caption HTML escaped');
     eq(count(glob($mediaRoot.'/attachments/wa_media/*.png')),1,'safe filename and extension');
     eq($download->calls,1,'one download');
     receive($webhook,envelope([$image])); $mediaBridge->tick();
-    eq((int)$db->one('SELECT COUNT(*) AS n FROM vicidial_chat_log WHERE chat_id=?',[$mediaSession['chat_id']])['n'],1,'duplicate callback does not duplicate media log');
+    eq((int)$db->one('SELECT COUNT(*) AS n FROM vicidial_chat_log WHERE chat_id=? AND chat_level=0',[$mediaSession['chat_id']])['n'],1,'duplicate callback does not duplicate media log');
     $account=(new \WaChat\Accounts($db))->all()['773505685855835'];
     $media->html($image,$account); eq($download->calls,1,'cached file reused after interrupted insertion');
     $image['id']='media.retry'; $image['image']['id']='123457'; $download->fail=true;
@@ -265,7 +377,7 @@ try {
     eq(count(glob($mediaRoot.'/attachments/wa_media/.download-*')),0,'partial files cleaned');
     $db->run('UPDATE wa_inbox SET attempts=7,next_attempt=0 WHERE id=?',[$event['id']]); $mediaBridge->tick();
     eq($db->one('SELECT state FROM wa_inbox WHERE id=?',[$event['id']])['state'],'failed','download retries bounded');
-    $last=$db->one('SELECT message FROM vicidial_chat_log WHERE chat_id=? ORDER BY message_row_id DESC LIMIT 1',[$mediaSession['chat_id']]);
+    $last=$db->one('SELECT message FROM vicidial_chat_log WHERE chat_id=? AND chat_level=0 ORDER BY message_row_id DESC LIMIT 1',[$mediaSession['chat_id']]);
     eq(strpos($last['message'],'media_hash_mismatch')!==false,true,'agent sees failed attachment');
     $download->corrupt=false;
     $image['image']['mime_type']='text/html';
@@ -274,6 +386,7 @@ try {
     foreach (glob($mediaRoot.'/attachments/wa_media/*') as $file) { unlink($file); }
     unlink($mediaRoot.'/attachments/wa_media/.htaccess'); rmdir($mediaRoot.'/attachments/wa_media');
     rmdir($mediaRoot.'/attachments'); rmdir($mediaRoot.'/checkout/chat_customer'); rmdir($mediaRoot.'/checkout'); rmdir($mediaRoot);
+    echo "Idle SELECTs per cycle: $quietQueries (unchanged with 200 additional sessions)\n";
     $engine=in_array('--innodb',$argv,true)?'InnoDB':'MyISAM';
     echo "PASS: $count MariaDB integration checks ($engine native and bridge tables)\n";
 } finally {

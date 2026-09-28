@@ -6,6 +6,7 @@ require_once __DIR__ . '/src/Protocol.php';
 require_once __DIR__ . '/src/Webhook.php';
 require_once __DIR__ . '/src/Media.php';
 require_once __DIR__ . '/src/GraphClient.php';
+require_once __DIR__ . '/src/ReplyPoller.php';
 require_once __DIR__ . '/src/Bridge.php';
 require_once __DIR__ . '/src/Preflight.php';
 

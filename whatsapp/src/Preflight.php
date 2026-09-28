@@ -14,8 +14,9 @@ final class Preflight
             'vicidial_chat_participants'=>['chat_id','chat_member','chat_member_name','vd_agent','ping_date'],
             'vicidial_chat_log'=>['chat_id','message','poster','chat_member_name','chat_level','message_time'],
             'vicidial_chat_log_archive'=>['chat_id','message','poster','chat_member_name','chat_level','message_time'],
-            'vicidial_users'=>['user'],
+            'vicidial_users'=>['user','full_name'],
             'wa_sessions'=>['id','state','last_inbound'], 'wa_inbox'=>['id','event_key','payload'],
+            'wa_worker_state'=>['name','last_id'],
             'wa_outbox'=>['id','wamid','state'], 'wa_vici_operations'=>['operation_key','target_id','row_json'],
         ];
         foreach ($required as $table=>$columns) {
@@ -44,16 +45,16 @@ final class Preflight
                 }
             }
         }
-        foreach (['wa_sessions','wa_inbox','wa_outbox','wa_vici_operations'] as $table) {
+        foreach (['wa_sessions','wa_inbox','wa_outbox','wa_vici_operations','wa_worker_state'] as $table) {
             $status=$db->one('SHOW TABLE STATUS WHERE Name=?',[$table]);
             if (!in_array(strtolower($status['Engine'] ?? ''), ['innodb','myisam'], true)) {
                 throw new \RuntimeException("$table must use MyISAM or InnoDB");
             }
         }
         $type=$db->columns('vicidial_chat_archive')['status']['Type'];
-        foreach (['DROP',$config['archive_complete_status']] as $status) {
+        foreach (['DROP'] as $status) {
             if (!preg_match('/^[A-Z_]+$/D',$status) || (strpos($type,'enum(')===0 && strpos($type,"'".$status."'")===false)) {
-                throw new \RuntimeException("Archive status $status is not supported by $type; configure archive_complete_status");
+                throw new \RuntimeException("Archive status $status is not supported by $type");
             }
         }
         $accounts=(new Accounts($db))->all();
