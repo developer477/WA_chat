@@ -15,9 +15,9 @@ final class Preflight
             'vicidial_chat_log'=>['chat_id','message','poster','chat_member_name','chat_level','message_time'],
             'vicidial_chat_log_archive'=>['chat_id','message','poster','chat_member_name','chat_level','message_time'],
             'vicidial_users'=>['user','full_name'],
-            'wa_sessions'=>['id','state','last_inbound'], 'wa_inbox'=>['id','event_key','payload'],
+            'wa_sessions'=>['id','state','last_inbound'], 'wa_inbox'=>['id','event_key','payload','sender','message_timestamp'],
             'wa_worker_state'=>['name','last_id'],
-            'wa_outbox'=>['id','wamid','state'], 'wa_vici_operations'=>['operation_key','target_id','row_json'],
+            'wa_outbox'=>['id','wamid','state','notice_pending'], 'wa_vici_operations'=>['operation_key','target_id','row_json'],
         ];
         foreach ($required as $table=>$columns) {
             foreach ($columns as $column) {

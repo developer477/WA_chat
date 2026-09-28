@@ -29,8 +29,10 @@ final class Webhook
         // This works without multi-statement transactions, including on MyISAM.
         foreach ($events as $event) {
             if (!isset($accounts[$event['phone']])) { continue; }
-            $this->db->run("INSERT INTO wa_inbox (event_key,phone_number_id,kind,payload,received_at) VALUES (?,?,?,?,?)
-                ON DUPLICATE KEY UPDATE event_key=VALUES(event_key)", [$event['key'],$event['phone'],$event['kind'],json_encode($event['payload'], JSON_THROW_ON_ERROR),time()]);
+            $message=$event['kind']==='message';
+            $this->db->run("INSERT INTO wa_inbox (event_key,phone_number_id,kind,payload,received_at,sender,message_timestamp) VALUES (?,?,?,?,?,?,?)
+                ON DUPLICATE KEY UPDATE event_key=VALUES(event_key)", [$event['key'],$event['phone'],$event['kind'],json_encode($event['payload'], JSON_THROW_ON_ERROR),time(),
+                    $message?$event['payload']['from']:null,$message?(int)$event['payload']['timestamp']:null]);
         }
     }
 

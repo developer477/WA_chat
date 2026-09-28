@@ -10,6 +10,8 @@ The bridge uses VICIdial's database as the interface to agents. No agent/admin o
 
 Supports customer/agent text, template button replies and incoming WhatsApp images, documents, audio, video and stickers as downloadable chat attachments with captions. Agent attachments continue to be sent as text links; outbound native WhatsApp media is not implemented.
 
+Five-second heartbeat maintenance expires inactive WhatsApp sessions using the existing customer departure behavior. Inbound retries are bounded; failed or uncertain outbound replies produce private agent notices with restart recovery. The status command separates customer messages from delivery notifications. Apply `whatsapp/sql/003_maintenance.sql` when upgrading; see the installation guide for the full procedure.
+
 ## Test server access
 
 The project test server is `deven024.cc.warmconnect.in`. Connect from the development laptop as `staff`:

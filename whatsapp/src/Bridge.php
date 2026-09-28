@@ -23,9 +23,13 @@ final class Bridge
     public function recover(): void
     {
         // A terminated process may have sent the HTTP request. Never resend it blindly.
-        $this->db->run("UPDATE wa_outbox SET state='uncertain',error_code='worker_interrupted' WHERE state='sending'");
+        $this->db->run("UPDATE wa_outbox SET state='uncertain',error_code='worker_interrupted',notice_pending='uncertain' WHERE state='sending'");
         foreach ($this->db->all("SELECT * FROM wa_sessions WHERE state='closing'") as $session) {
             $this->close($session,$session['close_reason'] ?: 'window_expired');
+        }
+        // Event-driven notices need only this startup recovery, never an idle poll.
+        while ($rows=$this->db->all('SELECT id FROM wa_outbox WHERE notice_pending IS NOT NULL ORDER BY id LIMIT 100')) {
+            foreach ($rows as $row) { $this->outboundNotice((int)$row['id']); }
         }
     }
 
@@ -35,7 +39,6 @@ final class Bridge
         if ((int)($this->db->one('SELECT allow_chats FROM system_settings')['allow_chats'] ?? 0) < 1) {
             throw new \RuntimeException('VICIdial chats are disabled');
         }
-        $this->heartbeat();
         $now = time();
         $limit = max(1, min(1000, (int)$this->config['batch_size']));
         // Only revisit buffered messages when the customer can actually deliver
@@ -47,26 +50,65 @@ final class Bridge
                 (i.state='waiting' AND (c.status='LIVE' OR c.chat_id IS NULL)))
             ORDER BY (i.state='waiting'),i.id LIMIT $limit", [$now]);
         foreach ($events as $event) {
-            $this->heartbeat();
+            $noticeId=null;
             try {
-                if ($event['kind'] === 'status') { $this->status($event); continue; }
-                if (!isset($accounts[$event['phone_number_id']])) { continue; }
-                $this->incoming($event, $accounts[$event['phone_number_id']]);
+                if ($event['kind'] === 'status') { $noticeId=$this->status($event); }
+                elseif (isset($accounts[$event['phone_number_id']])) { $this->incoming($event, $accounts[$event['phone_number_id']]); }
             } catch (\Throwable $e) {
-                // No SQL, message bodies or credentials in logs/error fields.
-                $this->db->run("UPDATE wa_inbox SET state='retry',attempts=attempts+1,next_attempt=?,error_code='processing_error' WHERE id=?", [time()+30,$event['id']]);
-                error_log('WhatsApp inbox ' . (int)$event['id'] . ': processing_error (' . get_class($e) . ')');
+                $this->inboundFailure($event,$e);
             }
+            // A notice write failure must restart the worker and recover the
+            // durable flag, rather than consume retries of an unrelated event.
+            if ($noticeId!==null) { $this->outboundNotice($noticeId); }
+            $this->heartbeat();
         }
         $this->replies->collect(max(1,min(10000,(int)($this->config['reply_batch_size'] ?? 1000))));
         $this->deliver($accounts, $limit);
+        $this->heartbeat();
     }
 
     private function heartbeat(): void
     {
-        if (time() - $this->lastHeartbeat < 5) { return; }
-        $this->lastHeartbeat = time();
-        $this->db->run("UPDATE vicidial_chat_participants p JOIN wa_sessions s ON s.chat_id=p.chat_id AND s.member=p.chat_member JOIN vicidial_live_chats c ON c.chat_id=s.chat_id SET p.ping_date=NOW() WHERE s.state='active' AND p.vd_agent='N'");
+        $now=time();
+        if ($now - $this->lastHeartbeat < 5) { return; }
+        $this->lastHeartbeat = $now;
+        $cutoff=$now-86400;
+        $limit=max(1,min(1000,(int)($this->config['expiry_batch_size'] ?? 100)));
+        // Both lookups are indexed: only expired active sessions and their
+        // unprocessed customer events, never all retained webhook JSON.
+        $queued="EXISTS (SELECT 1 FROM wa_inbox i WHERE i.phone_number_id=s.phone_number_id AND i.sender=s.sender
+            AND i.state IN ('pending','retry','waiting') AND i.message_timestamp>s.last_inbound
+            AND i.message_timestamp>? AND i.message_timestamp<=?)";
+        foreach ($this->db->all("SELECT s.* FROM wa_sessions s WHERE s.state='active' AND s.last_inbound<=?
+            AND NOT $queued ORDER BY s.last_inbound,s.id LIMIT $limit",[$cutoff,$cutoff,$now+300]) as $session) {
+            $this->close($session,'window_expired',true);
+        }
+        // Even if departures need several batches, stale customers are not
+        // kept alive. A genuine fresh queued message protects its participant.
+        $this->db->run("UPDATE vicidial_chat_participants p JOIN wa_sessions s ON s.chat_id=p.chat_id AND s.member=p.chat_member
+            JOIN vicidial_live_chats c ON c.chat_id=s.chat_id SET p.ping_date=NOW()
+            WHERE s.state='active' AND p.vd_agent='N' AND (s.last_inbound>? OR $queued)",[$cutoff,$cutoff,$now+300]);
+    }
+
+    private function inboundFailure(array $event, \Throwable $error): void
+    {
+        $attempts=(int)$event['attempts']+1;
+        $invalid=$error instanceof \JsonException || $error instanceof \InvalidArgumentException;
+        $state=$invalid || $attempts>=8 ? 'failed' : 'retry';
+        $code=$invalid?'invalid_payload':'processing_error';
+        if ($state==='failed') {
+            // Do not leave an abandoned partial chat blocking the shared reply
+            // cursor. Departure is journaled before making the event terminal.
+            $session=$this->db->one("SELECT s.* FROM wa_sessions s JOIN wa_inbox i ON i.id=?
+                WHERE s.state='provisioning' AND (s.id=i.session_id OR s.member=?)",
+                [$event['id'],'wa'.substr($event['event_key'],0,18)]);
+            if ($session) { $this->close($session,'inbound_failed'); }
+        }
+        $delay=min(300,30*(2 ** min(4,$attempts-1)));
+        $this->db->run('UPDATE wa_inbox SET state=?,attempts=?,next_attempt=?,error_code=? WHERE id=?',
+            [$state,$attempts,$state==='retry'?time()+$delay:0,$code,$event['id']]);
+        // No SQL, message bodies or credentials in logs/error fields.
+        error_log('WhatsApp inbox '.(int)$event['id'].': '.$code.' ('.get_class($error).')');
     }
 
     private function incoming(array $event, array $account): void
@@ -226,10 +268,9 @@ final class Bridge
         foreach ($rows as $row) {
             // A newer customer event may be behind this tick's inbox batch or
             // retrying. Decide this outbound message only after processing it.
-            if ($this->db->one("SELECT id FROM wa_inbox WHERE phone_number_id=? AND kind='message'
-                AND state IN ('pending','retry') AND JSON_UNQUOTE(JSON_EXTRACT(payload,'$.from'))=?
-                AND CAST(JSON_UNQUOTE(JSON_EXTRACT(payload,'$.timestamp')) AS UNSIGNED)>? LIMIT 1",
-                [$row['phone_number_id'],$row['sender'],$row['last_inbound']])) {
+            if ($this->db->one("SELECT id FROM wa_inbox WHERE phone_number_id=? AND sender=?
+                AND state IN ('pending','retry','waiting') AND message_timestamp>? AND message_timestamp>? AND message_timestamp<=? LIMIT 1",
+                [$row['phone_number_id'],$row['sender'],$row['last_inbound'],time()-86400,time()+300])) {
                 continue;
             }
             if (Protocol::expired((int)$row['last_inbound'],time()) || $row['close_reason']==='window_expired') {
@@ -244,48 +285,81 @@ final class Bridge
             }
             // Keep each conversation ordered. An uncertain earlier send requires reconciliation.
             if ($this->db->one("SELECT id FROM wa_outbox WHERE session_id=? AND id<? AND state IN ('pending','retry','sending','uncertain') LIMIT 1", [$row['session_id'],$row['id']])) { continue; }
-            $this->heartbeat();
             $this->db->run("UPDATE wa_outbox SET state='sending',attempts=attempts+1 WHERE id=?", [$row['id']]);
             try { $result=$this->sender->send($accounts[$row['phone_number_id']],$row['sender'],$row['body'],(int)$row['id']); }
             catch (\Throwable $e) { $result=['state'=>'uncertain','error'=>'send_exception']; }
             $state=$result['state'];
             if ($state==='retry' && (int)$row['attempts']>=7) { $state='failed'; }
             $delay=min(300, 5 * (2 ** min(6,(int)$row['attempts'])));
-            $this->db->run('UPDATE wa_outbox SET state=?,wamid=?,error_code=?,next_attempt=?,sent_at=? WHERE id=?',
-                [$state,$result['wamid'] ?? null,$result['error'] ?? null,time()+$delay,$state==='accepted'?time():null,$row['id']]);
+            $notice=in_array($state,['failed','uncertain'],true)?$state:null;
+            $this->db->run('UPDATE wa_outbox SET state=?,wamid=?,error_code=?,next_attempt=?,sent_at=?,notice_pending=? WHERE id=?',
+                [$state,$result['wamid'] ?? null,$result['error'] ?? null,time()+$delay,$state==='accepted'?time():null,$notice,$row['id']]);
+            if ($notice!==null) { $this->outboundNotice((int)$row['id']); }
+            $this->heartbeat();
         }
     }
 
-    private function status(array $event): void
+    private function status(array $event): ?int
     {
         $status=json_decode($event['payload'],true,512,JSON_THROW_ON_ERROR);
         $row=$this->db->one('SELECT o.* FROM wa_outbox o JOIN wa_sessions s ON s.id=o.session_id WHERE o.wamid=? AND s.phone_number_id=?', [$status['id'],$event['phone_number_id']]);
         if (!$row && preg_match('/^wa:([0-9]+)$/D', $status['biz_opaque_callback_data'] ?? '', $match)) {
             $row=$this->db->one('SELECT o.* FROM wa_outbox o JOIN wa_sessions s ON s.id=o.session_id WHERE o.id=? AND s.phone_number_id=? AND s.sender=?', [$match[1],$event['phone_number_id'],$status['recipient_id'] ?? '']);
         }
+        $noticeId=null;
         if ($row) {
             $delivery=Protocol::delivery($row['delivery_status'] ?? '',$status['status']);
             $state=$delivery==='failed'?'failed':($delivery!==''?'accepted':$row['state']);
             $error=$delivery==='failed'?'meta_'.(int)($status['errors'][0]['code'] ?? 0):null;
-            $this->db->run('UPDATE wa_outbox SET wamid=?,delivery_status=?,state=?,error_code=? WHERE id=?', [$status['id'],$delivery,$state,$error,$row['id']]);
+            $notice=$state==='failed' && $row['state']!=='failed'?'failed':$row['notice_pending'];
+            $this->db->run('UPDATE wa_outbox SET wamid=?,delivery_status=?,state=?,error_code=?,notice_pending=? WHERE id=?', [$status['id'],$delivery,$state,$error,$notice,$row['id']]);
+            if ($notice!==null) { $noticeId=(int)$row['id']; }
         }
         // Unrelated template sends are legitimate; they do not create customer chats.
         $this->db->run("UPDATE wa_inbox SET state='done',error_code=NULL WHERE id=?", [$event['id']]);
+        return $noticeId;
     }
 
-    public function close(array $session, string $reason): void
+    private function outboundNotice(int $id): void
     {
-        // Called only while handling a message, or recovering a departure already
-        // started before a crash. A quiet chat never enters here just due to age.
-        $current=$this->db->one('SELECT * FROM wa_sessions WHERE id=?',[$session['id']]);
-        if (!$current || $current['state']==='closed') { return; }
-        $this->db->run("UPDATE wa_sessions SET state='closing',close_reason=?,closed_at=COALESCE(closed_at,?) WHERE id=?",[$reason,time(),$session['id']]);
-        $session=$this->db->one('SELECT * FROM wa_sessions WHERE id=?',[$session['id']]);
+        // Same private customer-side log mechanism as the receiving-number note.
+        // Keep the chat present while inserting; do not recreate archived chats.
+        $this->db->run('LOCK TABLES wa_outbox WRITE,wa_sessions READ,vicidial_live_chats READ,vicidial_chat_log WRITE,vicidial_chat_log_archive READ,wa_vici_operations WRITE');
+        try {
+            $row=$this->db->one('SELECT * FROM wa_outbox WHERE id=?',[$id]);
+            if (!$row || $row['notice_pending']===null) { return; }
+            $session=$this->db->one('SELECT * FROM wa_sessions WHERE id=?',[$row['session_id']]);
+            if ($session && $session['chat_id'] && $this->db->one('SELECT chat_id FROM vicidial_live_chats WHERE chat_id=?',[$session['chat_id']])) {
+                $text=$row['notice_pending']==='uncertain'
+                    ? "Delivery of WhatsApp reply #$id is uncertain. It may already have been sent. Later replies are paused until its delivery status is resolved."
+                    : "WhatsApp reply #$id could not be delivered. Automatic retries have stopped.";
+                if ($row['error_code']) { $text.=' Error: '.$row['error_code'].'.'; }
+                $this->db->nativeInsert('outbox-notice:'.$id.':'.$row['notice_pending'],'vicidial_chat_log',[
+                    'chat_id'=>$session['chat_id'],'poster'=>$session['member'],'chat_member_name'=>'WhatsApp',
+                    'message_time'=>$this->db->timestamp(time()),'chat_level'=>1,'message'=>Protocol::customerHtml($text)
+                ],'vicidial_chat_log_archive',true);
+            }
+            $this->db->run('UPDATE wa_outbox SET notice_pending=NULL WHERE id=?',[$id]);
+        } finally { $this->db->run('UNLOCK TABLES'); }
+    }
+
+    public function close(array $session, string $reason, bool $onlyIfExpired = false): void
+    {
         $chatColumns=array_intersect_key($this->db->columns('vicidial_live_chats'),$this->db->columns('vicidial_chat_archive'));
         $logColumns=array_intersect_key($this->db->columns('vicidial_chat_log'),$this->db->columns('vicidial_chat_log_archive'));
         $optional=$this->db->one("SHOW TABLES LIKE 'chat_id_lead'") !== null;
         $this->db->run('LOCK TABLES vicidial_live_chats WRITE,vicidial_chat_archive WRITE,vicidial_chat_log WRITE,vicidial_chat_log_archive WRITE,vicidial_chat_participants WRITE,vicidial_list WRITE,wa_sessions WRITE,wa_inbox WRITE,wa_outbox WRITE,wa_vici_operations WRITE,vicidial_users READ' . ($optional?',chat_id_lead WRITE':''));
         try {
+            $session=$this->db->one('SELECT * FROM wa_sessions WHERE id=?',[$session['id']]);
+            if (!$session || $session['state']==='closed') { return; }
+            // A webhook may have arrived after the maintenance batch was read.
+            // Recheck under the inbox lock before committing customer departure.
+            if ($onlyIfExpired && (!Protocol::expired((int)$session['last_inbound'],time()) || $this->db->one(
+                "SELECT id FROM wa_inbox WHERE phone_number_id=? AND sender=? AND state IN ('pending','retry','waiting')
+                    AND message_timestamp>? AND message_timestamp>? AND message_timestamp<=? LIMIT 1",
+                [$session['phone_number_id'],$session['sender'],$session['last_inbound'],time()-86400,time()+300]))) { return; }
+            $this->db->run("UPDATE wa_sessions SET state='closing',close_reason=?,closed_at=COALESCE(closed_at,?) WHERE id=?",[$reason,time(),$session['id']]);
+            $session=$this->db->one('SELECT * FROM wa_sessions WHERE id=?',[$session['id']]);
             $chat=$this->db->one('SELECT * FROM vicidial_live_chats WHERE chat_id=?',[$session['chat_id']]);
             if ($chat && $chat['status']==='WAITING' && $chat['chat_creator']==='NONE') {
                 // Same unclaimed-chat DROP behavior as customer_chat_functions.php.
@@ -313,8 +387,9 @@ final class Bridge
             // Never remove the agent's participant or dispose their chat.
             $this->db->run("DELETE FROM vicidial_chat_participants WHERE chat_id=? AND chat_member=? AND vd_agent='N'",[$session['chat_id'],$session['member']]);
             if ($optional) { $this->db->run('UPDATE chat_id_lead SET status=NULL WHERE chat_id=?',[$session['chat_id']]); }
-            $this->db->run("UPDATE wa_inbox SET state='expired',error_code='window_expired' WHERE session_id=? AND state IN ('waiting','retry','pending')",[$session['id']]);
-            $this->db->run("UPDATE wa_outbox SET state='expired',error_code='window_expired' WHERE session_id=? AND state IN ('pending','retry')",[$session['id']]);
+            $terminal=$reason==='window_expired'?'expired':'closed';
+            $this->db->run("UPDATE wa_inbox SET state=?,error_code=? WHERE session_id=? AND state IN ('waiting','retry','pending')",[$terminal,$reason,$session['id']]);
+            $this->db->run("UPDATE wa_outbox SET state=?,error_code=? WHERE session_id=? AND state IN ('pending','retry')",[$terminal,$reason,$session['id']]);
             // Last write: if interrupted, recover() completes this departure once.
             $this->db->run("UPDATE wa_sessions SET state='closed' WHERE id=?",[$session['id']]);
         } finally { $this->db->run('UNLOCK TABLES'); }

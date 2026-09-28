@@ -9,6 +9,7 @@ require_once __DIR__ . '/src/GraphClient.php';
 require_once __DIR__ . '/src/ReplyPoller.php';
 require_once __DIR__ . '/src/Bridge.php';
 require_once __DIR__ . '/src/Preflight.php';
+require_once __DIR__ . '/src/Status.php';
 
 function wa_bootstrap(): array
 {
