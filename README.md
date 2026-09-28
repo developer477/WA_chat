@@ -28,3 +28,17 @@ The SSH private key stays on the laptop at `~/ssh_key_dialers`. This is the test
 Confirm the remote repository checkout path before running Git commands.
 
 The test checkout is `/srv/www/htdocs/WA_chat`, with `/srv/www/htdocs/whatsapp` symlinked to its `whatsapp/` directory. `staff` has passwordless sudo on this test server. The `wa-chat` systemd service runs the worker as `apache` using `/usr/bin/php` and is enabled at boot. Use `sudo systemctl restart wa-chat` after updating worker code and `sudo journalctl -u wa-chat -f` for worker logs. The default `/usr/local/bin/php` lacks required extensions.
+
+## Production compatibility branch
+
+Production is `chat.cc.trikon.in`. Use the same SSH user and laptop key:
+
+```sh
+ssh -C -i ~/ssh_key_dialers staff@chat.cc.trikon.in
+```
+
+`staff` has no sudo access on production. VICIdial files are at `/srv/www/htdocs` (resolves to `/var/www/htdocs`), and the database is `asterisk`. Do not copy the test server's sudo deployment commands to this server.
+
+Backport work belongs on `compat/legacy-vicidial`, created from deployed commit `78aa38f`. Read-only inspection on 2026-09-28 found VICIdial `2.14-853a` (DB schema `1657`), MariaDB `5.5.68`, and PHP CLI `5.4.16` at `/usr/bin/php`. The current bridge requires compatibility changes before installation. The production `WA_chat` checkout and `whatsapp` directory were absent at inspection time; the test checkout path is not an existing production deployment.
+
+See [production findings and proposed backport](whatsapp/LEGACY_BACKPORT.md) for the compatibility and installation plan. No production code, schema or service changes were made during inspection.
